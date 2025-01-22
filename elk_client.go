@@ -3,6 +3,8 @@ package goscs
 import (
 	"context"
 	"fmt"
+	"net"
+	"net/http"
 	"strings"
 	"time"
 
@@ -26,6 +28,15 @@ func (esc *EslasticClient[MsgType]) getDefaultConfig() *elasticsearch.Config {
 		Password:      esc.AuthPassword,
 		RetryOnStatus: []int{502, 503, 504},
 		MaxRetries:    3,
+		Transport: &http.Transport{
+			MaxIdleConns:        100,
+			MaxIdleConnsPerHost: 100,
+			IdleConnTimeout:     90 * time.Second,
+			DialContext: (&net.Dialer{
+				Timeout:   30 * time.Second,
+				KeepAlive: 30 * time.Second,
+			}).DialContext,
+		},
 	}
 }
 func (esc *EslasticClient[MsgType]) clearScroll(scrollID string) {
