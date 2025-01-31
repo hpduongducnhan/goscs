@@ -7,7 +7,7 @@ import (
 	"github.com/rs/zerolog"
 )
 
-var logger zerolog.Logger
+var logger *zerolog.Logger
 var isDev bool = strings.ToLower(os.Getenv("dev")) == "true" || os.Getenv("dev") == "1"
 
 func init() {
@@ -16,19 +16,35 @@ func init() {
 
 func configureLogger(name string, level zerolog.Level) {
 	zerolog.SetGlobalLevel(level)
+	var _logger zerolog.Logger
 	if isDev {
-		logger = zerolog.New(zerolog.ConsoleWriter{Out: os.Stdout}).With().Str("module", name).Timestamp().Caller().Logger()
+		_logger = zerolog.New(zerolog.ConsoleWriter{Out: os.Stdout}).With().Str("module", name).Timestamp().Caller().Logger()
 	} else {
-		logger = zerolog.New(os.Stdout).With().Str("module", name).Timestamp().Caller().Logger()
+		_logger = zerolog.New(os.Stdout).With().Str("module", name).Timestamp().Caller().Logger()
 	}
+	logger = &_logger
 }
 
-func GetLoger(name string, level zerolog.Level) zerolog.Logger {
-	if name == "" || level == 0 {
-		// default logger
-		return logger
-	} else {
-		configureLogger(name, level)
-		return logger
+func setDefaultNameLevel(name string, level zerolog.Level) (string, zerolog.Level) {
+	if name == "" {
+		name = "default"
 	}
+	if level == 0 {
+		level = zerolog.InfoLevel
+	}
+	return name, level
+}
+
+func GetLogger(name string, level zerolog.Level) zerolog.Logger {
+	name, level = setDefaultNameLevel(name, level)
+	if logger == nil {
+		configureLogger(name, level)
+	}
+	return *logger
+}
+
+func NewLogger(name string, level zerolog.Level) zerolog.Logger {
+	name, level = setDefaultNameLevel(name, level)
+	configureLogger(name, level)
+	return *logger
 }
