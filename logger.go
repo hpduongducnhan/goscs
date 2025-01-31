@@ -10,10 +10,6 @@ import (
 var logger *zerolog.Logger
 var isDev bool = strings.ToLower(os.Getenv("dev")) == "true" || os.Getenv("dev") == "1"
 
-func init() {
-	configureLogger("default", zerolog.InfoLevel)
-}
-
 func configureLogger(name string, level zerolog.Level) {
 	zerolog.SetGlobalLevel(level)
 	var _logger zerolog.Logger
