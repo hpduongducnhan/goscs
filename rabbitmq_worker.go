@@ -19,6 +19,7 @@ type ConsumerConfig struct {
 	PrefetchCount int
 	Channel       *amqp091.Channel
 	Exchange      string
+	ExchangeType  string
 	Queue         string
 	RoutingKey    string
 	Handler       RbmqBaseHandler
@@ -37,8 +38,8 @@ type RabbitMQWorker struct {
 
 	osSignalChan chan os.Signal
 
-	connectFailedCount int // use for retry when connect rabbitmq server
-	// connectionErrChan  chan *amqp091.Error // use for listen if rbmq connection is closed
+	connectFailedCount int                 // use for retry when connect rabbitmq server
+	connectionErrChan  chan *amqp091.Error // use for listen if rbmq connection is closed
 
 	setupDone bool
 	consumers map[string]ConsumerConfig // use for recreate consumers when reconnect rbmq
@@ -105,11 +106,41 @@ func (rw *RabbitMQWorker) setup() {
 		}
 	}()
 
+	// setup reconnect the lost connection
+	go func() {
+		rw.Logger.Info().Msg("create reconnect when connection is lost or broker down")
+		for {
+			select {
+			case <-rw.workerContext.Done():
+				return
+
+			case err, ok := <-rw.connectionErrChan:
+				rw.Logger.Info().Msg("got rw.connectionErrChan err")
+				if !ok {
+					rw.Logger.Error().Msg("connectionErrChan is closed, worker force quit unexpected")
+					// rw.connectionErrChan = make(chan *amqp091.Error)
+				} else {
+					rw.Logger.Error().Err(err).Msg("RabbitMQ connection lost, Reconnecting...")
+					// reconnect and init consumers
+					rw.connect()
+					rw.initConsumers()
+				}
+			}
+		}
+	}()
+
 	rw.setupDone = true
 	rw.Logger.Info().Msg("setup done")
 }
 
 func (rw *RabbitMQWorker) connect() {
+	// recreate error chan here
+	// rw.connectionErrChan = make(chan *amqp091.Error)
+	if rw.conn != nil && !rw.conn.IsClosed() {
+		return
+	}
+
+	rw.connectionErrChan = make(chan *amqp091.Error)
 	rw.connectFailedCount = 0
 	for {
 		var conn *amqp091.Connection
@@ -122,11 +153,12 @@ func (rw *RabbitMQWorker) connect() {
 				continue
 			} else {
 				rw.conn = conn
+				rw.conn.NotifyClose(rw.connectionErrChan)
 				rw.Logger.Info().Str("rbmqUrl", url).Msg("Connected rabbitmq")
 				return
 			}
 		}
-		if rw.conn == nil {
+		if rw.conn == nil || (rw.conn != nil && rw.conn.IsClosed()) {
 			rw.Logger.Warn().Msg("Connection failed. Retrying in 5 seconds...")
 			time.Sleep(5 * time.Second)
 		}
@@ -147,32 +179,40 @@ func (rw *RabbitMQWorker) createConsumerConfigUniqueKey(exchange, queue, routing
 	return fmt.Sprintf("%s+%s+%s", exchange, queue, routingKey)
 }
 
-func (rw *RabbitMQWorker) initConsumersTypeTopic() {
+func (rw *RabbitMQWorker) initConsumers() {
 	for _, consumerConf := range rw.consumers {
-		var err error
-		// create new channel
-		consumerConf.Channel, err = rw.conn.Channel()
-		if err != nil {
-			rw.Logger.Error().Err(err).Interface("consumerConfig", consumerConf).Msg("Create channel for consumer failed")
-			panic("Create channel for consumer failed")
+		if consumerConf.ExchangeType == "topic" {
+			rw.initConsumersTypeTopic(&consumerConf)
 		} else {
-			rw.Logger.Info().Msg("created new channel")
+			rw.Logger.Warn().Msg(fmt.Sprintf("init consumers not support exchange type %s", consumerConf.ExchangeType))
 		}
-		err = RbmqDeclareExchangeTopicWithDLXPattern(
-			consumerConf.Channel,
-			consumerConf.Exchange, consumerConf.Queue, consumerConf.RoutingKey,
-		)
-		if err != nil {
-			rw.Logger.Error().Err(err).Interface("consumerConfig", consumerConf).Msg("Create exchange, queue with DLX pattern failed")
-			panic("Create exchange, queue with DLX pattern failed")
-		} else {
-			rw.Logger.Info().Msg("Created exchange, queue with DLX pattern")
-		}
-		RbmqConsumeWithWorker(consumerConf.Ctx, consumerConf.PrefetchCount, consumerConf.Handler, consumerConf.Channel, consumerConf.Queue)
-		rw.Logger.Info().
-			Interface("consumerConfig", consumerConf).
-			Msg("Started Consumer")
 	}
+}
+
+func (rw *RabbitMQWorker) initConsumersTypeTopic(consumerConf *ConsumerConfig) {
+	var err error
+	// create new channel
+	consumerConf.Channel, err = rw.conn.Channel()
+	if err != nil {
+		rw.Logger.Error().Err(err).Interface("consumerConfig", consumerConf).Msg("Create channel for consumer failed")
+		panic("Create channel for consumer failed")
+	} else {
+		rw.Logger.Info().Msg("created new channel")
+	}
+	err = RbmqDeclareExchangeTopicWithDLXPattern(
+		consumerConf.Channel,
+		consumerConf.Exchange, consumerConf.Queue, consumerConf.RoutingKey,
+	)
+	if err != nil {
+		rw.Logger.Error().Err(err).Interface("consumerConfig", consumerConf).Msg("Create exchange, queue with DLX pattern failed")
+		panic("Create exchange, queue with DLX pattern failed")
+	} else {
+		rw.Logger.Info().Msg("Created exchange, queue with DLX pattern")
+	}
+	RbmqConsumeWithWorker(consumerConf.Ctx, consumerConf.PrefetchCount, consumerConf.Handler, consumerConf.Channel, consumerConf.Queue)
+	rw.Logger.Info().
+		Interface("consumerConfig", consumerConf).
+		Msg("Started Consumer")
 }
 
 func (rw *RabbitMQWorker) RegisterConsumerTypeTopic(
@@ -203,6 +243,7 @@ func (rw *RabbitMQWorker) RegisterConsumerTypeTopic(
 			CtxCancel:     consumerCtxCancel,
 			PrefetchCount: PrefetchCount,
 			Exchange:      exchange,
+			ExchangeType:  "topic",
 			Queue:         queue,
 			RoutingKey:    routingKey,
 			Handler:       handler,
@@ -219,7 +260,7 @@ func (rw *RabbitMQWorker) Run() {
 	// run with auto failover, reconnect
 	rw.checkConfig()
 	rw.connect()
-	rw.initConsumersTypeTopic()
+	rw.initConsumers()
 
 	rw.runWithRestHealthCheck()
 }

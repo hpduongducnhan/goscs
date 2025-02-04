@@ -82,7 +82,9 @@ func runRbmqWorker() {
 	logger := zerolog.New(zerolog.ConsoleWriter{Out: os.Stdout, NoColor: true})
 	worker := &goscs.RabbitMQWorker{
 		URLS: []string{
-			"amqp://guest:guest@192.168.1.6:5672//",
+			"amqp://admin:admin@192.168.1.6:5674//",
+			"amqp://admin:admin@192.168.1.6:5673//",
+			"amqp://admin:admin@192.168.1.6:5672//",
 		},
 		Logger: logger,
 	}
