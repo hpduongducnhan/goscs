@@ -3,57 +3,20 @@ package goscs
 import (
 	"context"
 	"fmt"
-	"log"
 	"net/http"
 	"os"
 	"os/signal"
+	"runtime"
 	"syscall"
 	"time"
 
-	"github.com/prometheus/client_golang/prometheus"
-	"github.com/prometheus/client_golang/prometheus/promhttp"
+	"github.com/google/uuid"
 	"github.com/rabbitmq/amqp091-go"
 	"github.com/rs/zerolog"
-	"github.com/shirou/gopsutil/process"
 )
 
-// Get worker's PID
-var workerPID = os.Getpid()
-
-func collectWorkerMetrics(
-	workerCPUUsage, workerMemUsage, workerIOReadBytes, workerIOWriteBytes prometheus.Gauge,
-) {
-	proc, err := process.NewProcess(int32(workerPID))
-	if err != nil {
-		log.Fatalf("Failed to get worker process: %v", err)
-	}
-
-	for {
-		// Get CPU usage
-		cpuPercent, err := proc.CPUPercent()
-		if err == nil {
-			workerCPUUsage.Set(cpuPercent)
-		}
-
-		// Get memory usage
-		memInfo, err := proc.MemoryInfo()
-		if err == nil {
-			workerMemUsage.Set(float64(memInfo.RSS)) // Resident Set Size (actual memory usage)
-		}
-
-		// Get I/O stats
-		ioStat, err := proc.IOCounters()
-		if err == nil {
-			workerIOReadBytes.Set(float64(ioStat.ReadBytes))
-			workerIOWriteBytes.Set(float64(ioStat.WriteBytes))
-		}
-
-		// Wait before collecting metrics again
-		time.Sleep(5 * time.Second)
-	}
-}
-
 type ConsumerConfig struct {
+	Name          string
 	Ctx           context.Context
 	CtxCancel     context.CancelFunc
 	PrefetchCount int
@@ -65,10 +28,21 @@ type ConsumerConfig struct {
 	Handler       RbmqBaseHandler
 }
 
+func (c *ConsumerConfig) MarshalZerologObject(e *zerolog.Event) {
+	e.Int("PrefetchCount", c.PrefetchCount).
+		Str("Name", c.Name).
+		Str("Exchange", c.Exchange).
+		Str("ExchangeType", c.ExchangeType).
+		Str("Queue", c.Queue).
+		Str("RoutingKey", c.RoutingKey)
+}
+
 type RabbitMQWorker struct {
 	Logger zerolog.Logger
 	URLS   []string
-	conn   *amqp091.Connection
+	Name   string
+
+	conn *amqp091.Connection
 
 	workerContext               context.Context
 	workerCancel                context.CancelFunc
@@ -88,103 +62,31 @@ type RabbitMQWorker struct {
 	consumers map[string]ConsumerConfig // use for recreate consumers when reconnect rbmq
 }
 
-func (rw *RabbitMQWorker) runWithRestServer() {
-	if rw.workerRestSvr != nil {
-		return
-	}
+func (rw *RabbitMQWorker) MarshalZerologObject(e *zerolog.Event) {
+	e.Strs("URLS", rw.URLS).
+		Str("Name", rw.Name).
+		Int("WorekrRestSvrPort", rw.WorekrRestSvrPort).
+		Str("WorkerRestSvrHealthCheckUrl", rw.WorkerRestSvrHealthCheckUrl).
+		Bool("PrometheusEnable", rw.PrometheusEnable).
+		Str("PrometheusMetricUrl", rw.PrometheusMetricUrl).
+		Int("connectFailedCount", rw.connectFailedCount).
+		Bool("setupDone", rw.setupDone).
+		Int("num_consumers", len(rw.consumers))
+}
+
+func (rw *RabbitMQWorker) setupDefaults() {
 	if rw.WorkerRestSvrHealthCheckUrl == "" {
 		rw.WorkerRestSvrHealthCheckUrl = "/health"
 	}
 	if rw.WorekrRestSvrPort == 0 {
 		rw.WorekrRestSvrPort = 8080
 	}
-
-	if rw.PrometheusEnable {
-		if rw.PrometheusMetricUrl == "" {
-			rw.PrometheusMetricUrl = "/metrics"
+	if rw.Name == "" {
+		hostname, err := os.Hostname()
+		if err != nil {
+			hostname = uuid.New().String()
 		}
-
-		// declare prometheus
-		messagesProcessed := prometheus.NewCounter(
-			prometheus.CounterOpts{
-				Name: "rabbitmq_messages_processed_total",
-				Help: "Total number of messages processed from RabbitMQ",
-			},
-		)
-
-		messageProcessingTime := prometheus.NewHistogram(
-			prometheus.HistogramOpts{
-				Name:    "rabbitmq_message_processing_seconds",
-				Help:    "Time taken to process each RabbitMQ message",
-				Buckets: prometheus.DefBuckets,
-			},
-		)
-
-		cpuUsage := prometheus.NewGauge(
-			prometheus.GaugeOpts{
-				Name: "worker_cpu_usage_percent",
-				Help: "Current CPU usage percentage of the worker",
-			},
-		)
-
-		memUsage := prometheus.NewGauge(
-			prometheus.GaugeOpts{
-				Name: "worker_memory_usage_bytes",
-				Help: "Current memory usage of the worker in bytes",
-			},
-		)
-
-		ioReadBytes := prometheus.NewGauge(
-			prometheus.GaugeOpts{
-				Name: "worker_io_read_bytes",
-				Help: "Bytes read by the worker",
-			},
-		)
-
-		ioWriteBytes := prometheus.NewGauge(
-			prometheus.GaugeOpts{
-				Name: "worker_io_write_bytes",
-				Help: "Bytes written by the worker",
-			},
-		)
-
-		// collect system info with interval
-		go collectWorkerMetrics(cpuUsage, memUsage, ioReadBytes, ioWriteBytes)
-
-		// register
-		prometheus.MustRegister(messagesProcessed)
-		prometheus.MustRegister(messageProcessingTime)
-		prometheus.MustRegister(cpuUsage)
-		prometheus.MustRegister(memUsage)
-		prometheus.MustRegister(ioReadBytes)
-		prometheus.MustRegister(ioWriteBytes)
-
-	}
-
-	mux := http.NewServeMux()
-	mux.HandleFunc(rw.WorkerRestSvrHealthCheckUrl, func(w http.ResponseWriter, r *http.Request) {
-		response := `{"status":"ok"}`
-		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(http.StatusOK)
-		fmt.Fprint(w, response)
-	})
-	mux.Handle(rw.PrometheusMetricUrl, promhttp.Handler())
-	rw.workerRestSvr = &http.Server{
-		Addr:    fmt.Sprintf(":%d", rw.WorekrRestSvrPort),
-		Handler: mux,
-	}
-
-	// add goroutine if you need
-	func() {
-		if err := rw.workerRestSvr.ListenAndServe(); err != http.ErrServerClosed {
-			rw.Logger.Error().Err(err).Msg("HTTP server error, shutdown")
-		}
-	}()
-}
-
-func (rw *RabbitMQWorker) setup() {
-	if rw.setupDone {
-		return
+		rw.Name = fmt.Sprintf("%s[%s]", hostname, runtime.GOOS)
 	}
 
 	// create context for this worker
@@ -193,17 +95,19 @@ func (rw *RabbitMQWorker) setup() {
 	// create map consumer
 	rw.consumers = make(map[string]ConsumerConfig, 0)
 
+}
+
+func (rw *RabbitMQWorker) setupTerminatedSignals() {
 	// setup goroutine wait os terminated signal to stop worker
 	rw.osSignalChan = make(chan os.Signal, 1)
 	signal.Notify(rw.osSignalChan, syscall.SIGINT, syscall.SIGTERM)
+
+	// create goroutine listen signal
 	go func() {
 		<-rw.osSignalChan
+		// cancel context
 		rw.workerCancel()
-		rw.Logger.Info().Msg("worker canceled, waiting .....!")
-
-		// shutdown healthcheck server
-		wRestSvrCtx, _ := context.WithTimeout(context.Background(), 5*time.Second)
-		rw.workerRestSvr.Shutdown(wRestSvrCtx)
+		rw.Logger.Info().Msg("worker canceled, shutting down .....!")
 
 		// shutdown all consumers
 		for _, consumerConf := range rw.consumers {
@@ -211,11 +115,22 @@ func (rw *RabbitMQWorker) setup() {
 				consumerConf.CtxCancel()
 			}
 		}
-	}()
 
+		// shutdown healthcheck server
+		wRestSvrCtx, wRestSvrCtxCancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer wRestSvrCtxCancel()
+		err := rw.workerRestSvr.Shutdown(wRestSvrCtx)
+		if err != nil {
+			time.Sleep(5 * time.Second)
+		}
+	}()
+}
+
+func (rw *RabbitMQWorker) setupConsumerFailoverAndReconnect() {
 	// setup reconnect the lost connection
+	// by create a listener event connection error
 	go func() {
-		rw.Logger.Info().Msg("create reconnect when connection is lost or broker down")
+		rw.Logger.Info().Msg("setup Failover and Reconnect -> done")
 		for {
 			select {
 			case <-rw.workerContext.Done():
@@ -235,9 +150,31 @@ func (rw *RabbitMQWorker) setup() {
 			}
 		}
 	}()
+}
+
+func (rw *RabbitMQWorker) beforeSetup() {
+	// let embeded struct add more actions
+}
+
+func (rw *RabbitMQWorker) afterSetup() {
+	// let embeded struct add more actions
+}
+
+func (rw *RabbitMQWorker) setup() {
+	if rw.setupDone {
+		return
+	}
+
+	rw.beforeSetup()
+
+	rw.setupDefaults()
+	rw.setupTerminatedSignals()
+	rw.setupConsumerFailoverAndReconnect()
+
+	rw.afterSetup()
 
 	rw.setupDone = true
-	rw.Logger.Info().Msg("setup done")
+	rw.Logger.Info().Msg("worker setup -> done")
 }
 
 func (rw *RabbitMQWorker) connect() {
@@ -276,87 +213,9 @@ func (rw *RabbitMQWorker) checkConfig() {
 	if len(rw.URLS) == 0 {
 		panic("URLS is empty")
 	}
-	// if len(rw.consumers) == 0 {
-	// 	panic("not found any config for consumer, use Register Consumer before Run")
-	// }
-}
-
-// -----------------------------------------
-func (rw *RabbitMQWorker) createConsumerConfigUniqueKey(exchange, queue, routingKey string) string {
-	return fmt.Sprintf("%s+%s+%s", exchange, queue, routingKey)
-}
-
-func (rw *RabbitMQWorker) initConsumers() {
-	for _, consumerConf := range rw.consumers {
-		if consumerConf.ExchangeType == "topic" {
-			rw.initConsumersTypeTopic(&consumerConf)
-		} else {
-			rw.Logger.Warn().Msg(fmt.Sprintf("init consumers not support exchange type %s", consumerConf.ExchangeType))
-		}
+	if len(rw.consumers) == 0 {
+		panic("not found any configs for consumer, use Register Consumer before Run")
 	}
-}
-
-func (rw *RabbitMQWorker) initConsumersTypeTopic(consumerConf *ConsumerConfig) {
-	var err error
-	// create new channel
-	consumerConf.Channel, err = rw.conn.Channel()
-	if err != nil {
-		rw.Logger.Error().Err(err).Interface("consumerConfig", consumerConf).Msg("Create channel for consumer failed")
-		panic("Create channel for consumer failed")
-	} else {
-		rw.Logger.Info().Msg("created new channel")
-	}
-	err = RbmqDeclareExchangeTopicWithDLXPattern(
-		consumerConf.Channel,
-		consumerConf.Exchange, consumerConf.Queue, consumerConf.RoutingKey,
-	)
-	if err != nil {
-		rw.Logger.Error().Err(err).Interface("consumerConfig", consumerConf).Msg("Create exchange, queue with DLX pattern failed")
-		panic("Create exchange, queue with DLX pattern failed")
-	} else {
-		rw.Logger.Info().Msg("Created exchange, queue with DLX pattern")
-	}
-	RbmqConsumeWithWorker(consumerConf.Ctx, consumerConf.PrefetchCount, consumerConf.Handler, consumerConf.Channel, consumerConf.Queue)
-	rw.Logger.Info().
-		Interface("consumerConfig", consumerConf).
-		Msg("Started Consumer")
-}
-
-func (rw *RabbitMQWorker) RegisterConsumerTypeTopic(
-	exchange, queue, routingKey string,
-	PrefetchCount int,
-	handler RbmqBaseHandler,
-) error {
-	// run setup first
-	rw.setup()
-
-	if PrefetchCount == 0 {
-		PrefetchCount = 3
-	}
-	if exchange == "" || queue == "" || routingKey == "" {
-		rw.Logger.Error().
-			Str("rbmqExchange", exchange).
-			Str("rbmqQueue", queue).
-			Str("rbmqRoutingKey", routingKey).
-			Msg("Register failed because exchange or queue or routingKey is empty")
-		return fmt.Errorf("register failed because exchange or queue or routingKey is empty")
-	}
-	key := rw.createConsumerConfigUniqueKey(exchange, queue, routingKey)
-	consumerCtx, consumerCtxCancel := context.WithCancel(context.Background())
-
-	if _, exists := rw.consumers[key]; !exists {
-		rw.consumers[key] = ConsumerConfig{
-			Ctx:           consumerCtx,
-			CtxCancel:     consumerCtxCancel,
-			PrefetchCount: PrefetchCount,
-			Exchange:      exchange,
-			ExchangeType:  "topic",
-			Queue:         queue,
-			RoutingKey:    routingKey,
-			Handler:       handler,
-		}
-	}
-	return nil
 }
 
 // -----------------------------------------
@@ -369,5 +228,5 @@ func (rw *RabbitMQWorker) Run() {
 	rw.connect()
 	rw.initConsumers()
 
-	rw.runWithRestServer()
+	rw.runWithMonitorAgent()
 }

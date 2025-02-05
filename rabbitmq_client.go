@@ -142,7 +142,7 @@ func RbmqAck(rbmqChannel *amqp091.Channel, msg *amqp091.Delivery, err error) {
 	msg.Nack(false, false)
 }
 
-type RbmqBaseHandler func(msg *amqp091.Delivery) error
+type RbmqBaseHandler func(msg *amqp091.Delivery, ch *amqp091.Channel) error
 
 func rbmqConsumer(
 	rbmqChannel *amqp091.Channel,
@@ -151,9 +151,11 @@ func rbmqConsumer(
 	wg *sync.WaitGroup, // WaitGroup to signal completion
 
 ) {
+	// proces all fetched messages,
+	// if internalMsgChan closed, then exit the internal worker
 	defer wg.Done()
 	for msg := range internalMsgChan {
-		err := handler(msg)
+		err := handler(msg, rbmqChannel)
 		RbmqAck(rbmqChannel, msg, err)
 	}
 }
@@ -164,9 +166,10 @@ func RbmqConsumeWithWorker(
 	handler RbmqBaseHandler,
 	channel *amqp091.Channel,
 	queueName string,
+	consumerName string,
 ) {
 	// make sure it run in a new go routine
-	go rbmqConsumeWithWorker(ctx, totalWorker, handler, channel, queueName)
+	go rbmqConsumeWithWorker(ctx, totalWorker, handler, channel, queueName, consumerName)
 }
 
 func rbmqConsumeWithWorker(
@@ -175,44 +178,49 @@ func rbmqConsumeWithWorker(
 	handler RbmqBaseHandler,
 	channel *amqp091.Channel,
 	queueName string,
+	consumerName string,
 ) {
 	if totalWorker <= 0 {
 		totalWorker = 1
 	}
+	// set qos for this channel
 	channel.Qos(
 		totalWorker, // Prefetch count (one message at a time)
 		0,           // Prefetch size
 		false,       // Apply to this consumer only
 	)
-	internalMsgChan := make(chan *amqp091.Delivery)
-	var wg sync.WaitGroup
-	for i := 0; i < totalWorker; i++ {
-		wg.Add(1)
-		go rbmqConsumer(channel, handler, internalMsgChan, &wg)
-	}
-
+	// consume messages
 	rbmqMessages, err := channel.Consume(
-		queueName, // queue
-		"",        // consumer
-		false,     // auto ack
-		false,     // exclusive
-		false,     // no local
-		false,     // no wait
-		nil,       // args
+		queueName,    // queue
+		consumerName, // consumer
+		false,        // auto ack
+		false,        // exclusive
+		false,        // no local
+		false,        // no wait
+		nil,          // args
 	)
 	if err != nil {
 		fmt.Printf("consume message rbmq get error %s", err.Error())
 		return
 	}
+
+	// create worker to handle message
+	internalMsgChan := make(chan *amqp091.Delivery)
+	var wg sync.WaitGroup
+	defer wg.Wait()
+	for i := 0; i < totalWorker; i++ {
+		wg.Add(1)
+		go rbmqConsumer(channel, handler, internalMsgChan, &wg)
+	}
+
 	for msg := range rbmqMessages {
 		select {
 		case internalMsgChan <- &msg:
 		case <-ctx.Done():
+			// close channel
+			// wait for handler process all messages in internalMsgChan then shutdown
 			close(internalMsgChan)
-			wg.Wait()
 			return
 		}
 	}
-	// Wait for all workers to finish
-	wg.Wait()
 }

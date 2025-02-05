@@ -14,7 +14,7 @@ var EXCHANGE_NAME = "exampleExchange"
 var QUEUE_NAME = "exampleQueue"
 var ROUTING_KEY = "chat.facebook"
 
-func consumeMessage(channel *amqp091.Channel, queueName string) {
+func ConsumeMessage(channel *amqp091.Channel, queueName string) {
 	_ = channel.Qos(
 		1,     // Prefetch count (one message at a time)
 		0,     // Prefetch size
@@ -50,7 +50,7 @@ func consumeMessage(channel *amqp091.Channel, queueName string) {
 	}
 }
 
-func runRabbitMQWithWorker() {
+func RunRabbitMQWithWorker() {
 	fmt.Printf("hello\n")
 	rabbitmqConn, err := goscs.RbmqConnect("amqp://guest:guest@192.168.1.6:5672//")
 	if err != nil {
@@ -70,15 +70,15 @@ func runRabbitMQWithWorker() {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	goscs.RbmqConsumeWithWorker(ctx, 2, func(msg *amqp091.Delivery) error {
+	goscs.RbmqConsumeWithWorker(ctx, 2, func(msg *amqp091.Delivery, ch *amqp091.Channel) error {
 		return nil
-	}, channel, QUEUE_NAME)
+	}, channel, QUEUE_NAME, "")
 
 	// time.Sleep(30 * time.Second)
 	// cancel()
 }
 
-func runRbmqWorker() {
+func RunRbmqWorker() {
 	logger := zerolog.New(zerolog.ConsoleWriter{Out: os.Stdout, NoColor: true})
 	worker := &goscs.RabbitMQWorker{
 		URLS: []string{
@@ -93,22 +93,22 @@ func runRbmqWorker() {
 	}
 	worker.RegisterConsumerTypeTopic(
 		"exampleExchange", "exampleQueue", "chat.facebook", 2,
-		func(msg *amqp091.Delivery) error {
+		func(msg *amqp091.Delivery, ch *amqp091.Channel) error {
 			logger.Info().Interface("rbmqMessage", msg).Msg("get rabbitmq message")
 			return nil
 		},
 	)
 	worker.RegisterConsumerTypeTopic(
 		"testExchange", "testQueue", "chat.zalo", 2,
-		func(msg *amqp091.Delivery) error {
+		func(msg *amqp091.Delivery, ch *amqp091.Channel) error {
 			logger.Info().Interface("rbmqMessage", msg).Msg("get rabbitmq message")
 			return nil
 		},
 	)
-	logger.Info().Msg("register done")
+	logger.Info().Msg("registered consumers -> done")
 	worker.Run()
 }
 
 func main() {
-	runRbmqWorker()
+	RunRbmqWorker()
 }
