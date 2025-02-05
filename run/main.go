@@ -86,7 +86,10 @@ func runRbmqWorker() {
 			"amqp://admin:admin@192.168.1.6:5673//",
 			"amqp://admin:admin@192.168.1.6:5672//",
 		},
-		Logger: logger,
+		Logger:           logger,
+		PrometheusEnable: true,
+
+		WorekrRestSvrPort: 8088,
 	}
 	worker.RegisterConsumerTypeTopic(
 		"exampleExchange", "exampleQueue", "chat.facebook", 2,
